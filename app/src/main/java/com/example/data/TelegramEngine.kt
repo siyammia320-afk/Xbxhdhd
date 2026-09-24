@@ -19,6 +19,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
+import kotlin.random.Random
 
 data class UserSession(
     var mode: String = "",       // "auto" or "manual"
@@ -29,6 +30,8 @@ data class UserSession(
     var otp: String = "",
     var uid: String = "",
     var cookie: String = "",
+    var csi: String = "",
+    var waterfallId: String = "",
     var confirmLink: String = "",
     var actorId: String = "",
     var fbDtsg: String = "",
@@ -188,7 +191,7 @@ class TelegramEngine(
         }
     }
 
-    // ================= KEYBOARDS (EXACT PYTHON SPEC) =================
+    // ================= KEYBOARDS =================
     private fun getMainMenuKeyboard(): String {
         return """
         {
@@ -281,6 +284,8 @@ class TelegramEngine(
             session.uid = result.uid
             session.cookie = result.cookie
             session.confirmLink = result.confirmLink
+            session.csi = result.csi
+            session.waterfallId = result.waterfallId
             session.actorId = result.actorId
             session.fbDtsg = result.fbDtsg
             session.lsd = result.lsd
@@ -365,6 +370,8 @@ class TelegramEngine(
             session.uid = result.uid
             session.cookie = result.cookie
             session.confirmLink = result.confirmLink
+            session.csi = result.csi
+            session.waterfallId = result.waterfallId
             session.actorId = result.actorId
             session.fbDtsg = result.fbDtsg
             session.lsd = result.lsd
@@ -438,12 +445,15 @@ class TelegramEngine(
         sendMessage(chatId, "Main Menu:", replyMarkup = getMainMenuKeyboard())
     }
 
-    // ================= META ACCOUNT CREATION & CONFIRMATION =================
+    // ================= META ACCOUNT CREATION & CONFIRMATION (1:1 PYTHON LOGIC) =================
     data class MetaCreateResult(
         val success: Boolean,
+        val email: String = "",
         val uid: String = "",
         val message: String = "",
         val cookie: String = "",
+        val csi: String = "",
+        val waterfallId: String = "",
         val confirmLink: String = "",
         val actorId: String = "",
         val fbDtsg: String = "",
@@ -458,12 +468,111 @@ class TelegramEngine(
     data class TempMailData(val address: String, val token: String)
     data class TempEmailItem(val bodyText: String, val bodyHtml: String)
 
+    private fun generateRandomToken(length: Int = 24): String {
+        val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        return (1..length).map { chars.random() }.joinToString("")
+    }
+
+    private fun parseMetaResponse(text: String): JSONObject? {
+        var clean = text.trim()
+        if (clean.startsWith("for (;;);")) {
+            clean = clean.substring("for (;;);".length)
+        }
+        return try {
+            JSONObject(clean)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun extractTokensAndUid(html: String): Triple<String, String, String> {
+        var fbDtsg = ""
+        var lsd = ""
+        var actorId = ""
+
+        val dtsgPatterns = listOf(
+            "\\[\"DTSGInitialData\",\\[\\],\\{\"token\":\"([^\"]+)\"\\}",
+            "name=\"fb_dtsg\"\\s+value=\"([^\"]+)\"",
+            "\"token\":\"(NAf[^\"]+)\""
+        )
+        for (p in dtsgPatterns) {
+            val m = Pattern.compile(p).matcher(html)
+            if (m.find()) {
+                fbDtsg = m.group(1) ?: ""
+                break
+            }
+        }
+
+        val lsdPatterns = listOf(
+            "\\[\"LSD\",\\[\\],\\{\"token\":\"([^\"]+)\"\\}",
+            "name=\"lsd\"\\s+value=\"([^\"]+)\"",
+            "\"token\":\"([0-9a-zA-Z_\\-]{20,})\""
+        )
+        for (p in lsdPatterns) {
+            val m = Pattern.compile(p).matcher(html)
+            if (m.find()) {
+                lsd = m.group(1) ?: ""
+                break
+            }
+        }
+
+        val uidPatterns = listOf(
+            "\"ACCOUNT_ID\":\"(\\d+)\"",
+            "\"USER_ID\":\"(\\d+)\"",
+            "\"actor_id\":\"(\\d+)\""
+        )
+        for (p in uidPatterns) {
+            val m = Pattern.compile(p).matcher(html)
+            if (m.find()) {
+                val found = m.group(1) ?: ""
+                if (found != "0") {
+                    actorId = found
+                    break
+                }
+            }
+        }
+
+        return Triple(fbDtsg, lsd, actorId)
+    }
+
+    private fun classifyCreateResponse(statusCode: Int, data: JSONObject?, rawText: String): Pair<Boolean, String> {
+        if (data == null) {
+            if (rawText.contains("uid")) {
+                val m = Pattern.compile("\"uid\":\\s*\"?(\\d+)\"?").matcher(rawText)
+                if (m.find()) {
+                    return Pair(true, m.group(1) ?: "")
+                }
+            }
+            return Pair(false, "Unable to parse response")
+        }
+
+        val payload = data.optJSONObject("payload")
+        if (payload != null && payload.has("uid")) {
+            return Pair(true, payload.optString("uid"))
+        }
+
+        if (data.has("error")) {
+            val desc = data.optString("errorDescription")
+                .ifEmpty { data.optString("errorSummary") }
+                .ifEmpty { "Unknown error" }
+            return Pair(false, desc)
+        }
+
+        return Pair(false, "Unknown response")
+    }
+
+    private fun calculateJazoest(token: String): String {
+        if (token.isEmpty()) return "25584"
+        val sum = token.toCharArray().sumOf { it.code }
+        return "2$sum"
+    }
+
     private suspend fun createTempMail(): TempMailData? = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
                 .url(TEMPMAIL_CREATE_URL)
                 .post("".toRequestBody("application/json".toMediaType()))
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; itel S665L Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.87 Mobile Safari/537.36")
                 .header("Origin", "https://instanttempemail.com")
                 .header("Referer", "https://instanttempemail.com/")
                 .build()
@@ -491,7 +600,7 @@ class TelegramEngine(
         try {
             val request = Request.Builder()
                 .url("$TEMPMAIL_INBOX_URL$token")
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; itel S665L Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.87 Mobile Safari/537.36")
                 .header("Origin", "https://instanttempemail.com")
                 .header("Referer", "https://instanttempemail.com/")
                 .build()
@@ -499,7 +608,8 @@ class TelegramEngine(
             client.newCall(request).execute().use { response ->
                 if (response.isSuccessful) {
                     val body = response.body?.string().orEmpty()
-                    val jsonArr = JSONArray(body)
+                    val json = JSONObject(body)
+                    val jsonArr = json.optJSONArray("emails") ?: JSONArray()
                     for (i in 0 until jsonArr.length()) {
                         val obj = jsonArr.getJSONObject(i)
                         list.add(
@@ -519,20 +629,29 @@ class TelegramEngine(
 
     private suspend fun createMetaAccount(email: String, pass: String): MetaCreateResult = withContext(Dispatchers.IO) {
         try {
+            val savedCsi = "Scd0BS3l-yOix38o6lNKa_kT"
+            val savedWf = "701777af-c668-4a8d-976a-0c0f619d807a"
+
             val formBuilder = FormBody.Builder()
                 .add("consent_version", "")
                 .add("contact_point_type", "EMAIL_ADDRESS")
-                .add("csi", "Scd0BS3l-yOix38o6lNKa_kT")
+                .add("csi", savedCsi)
                 .add("date_of_birth", "1993-09-11")
                 .add("device_id", "")
+                .add("fb_encrypted_access_token", "")
+                .add("fb_oidc_access_token", "")
                 .add("first_name", "Ajs")
-                .add("last_name", "Sjs")
+                .add("google_id_token", "")
                 .add("has_youth_consent", "false")
+                .add("ig_encrypted_access_token", "")
+                .add("ig_encrypted_auth_header", "")
+                .add("ig_oidc_access_token", "")
+                .add("last_name", "Sjs")
                 .add("opt_into_marketing", "true")
                 .add("password", pass)
                 .add("reg_integrity", "Q8W2BTuKa24cQO_B6qvNeGtvmIjuAiCCCvXaCbgkwfWbqt-rPjXJArjnIu5K2myj2GHMJPPSr6BbjXBUFU17JuiZ3IvWTGB_fpfbXwr1sq6qX5lwBCHho2TWDE4ACpgpKGop91SIXofE0KTu2MBkdW1Ss0D6TG7isv6lz2N1CLlYDcRuoiMmSnzt_3_tNldGlheeYm1KVKQyQckdk6G2PoiceW2vxKWbivZ6HJPdq-QsNs4JB7yqEnYY2B3u6mfepC066IZYhv9ZgWpXIuYUsgim6pBbL6NyF84-UsOy8kYIOZlCHc_2PFK4SRPhdx0RMJipGYiIeb5y-Nwj_VHS1Tc2es-jc6aZ7hlBsBokGAeo-cnYEERpIKXz_OnmFTc48WHp2nMcJxww|kregenc")
                 .add("should_save_credentials", "true")
-                .add("waterfall_id", "701777af-c668-4a8d-976a-0c0f619d807a")
+                .add("waterfall_id", savedWf)
                 .add("caa_event_flow", "ntf")
                 .add("entry_point", "login_home")
                 .add("event_client_time", "${System.currentTimeMillis() / 1000}.654")
@@ -549,96 +668,193 @@ class TelegramEngine(
                 .add("__spin_b", "trunk")
                 .add("__spin_t", "${System.currentTimeMillis() / 1000}")
                 .add("__jssesw", "1")
-                .add("email", email)
+                .add("contact_point", email)
+                .add("redirect_uri", "https://auth.meta.com/recover/success/?redirect_uri=https%3A%2F%2Fauth.meta.com%2Foidc%3Fapp_id%3D1522763855472543")
 
             val request = Request.Builder()
                 .url(TARGET_CREATE_URL)
                 .post(formBuilder.build())
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
-                .header("Origin", "https://auth.meta.com")
-                .header("Referer", "https://auth.meta.com/")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; itel S665L Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.87 Mobile Safari/537.36")
+                .header("Accept-Encoding", "gzip, deflate")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("sec-ch-ua", "\"Chromium\";v=\"152\", \"Not?A_Brand\";v=\"24\", \"Android WebView\";v=\"152\"")
+                .header("sec-ch-ua-mobile", "?1")
+                .header("sec-ch-ua-platform", "\"Android\"")
+                .header("x-asbd-id", "359341")
+                .header("x-fb-lsd", "AdRLdRXnKs4_RAGnmEr-k2XaQu0")
+                .header("origin", "https://auth.meta.com")
+                .header("x-requested-with", "mark.via.gp")
+                .header("sec-fetch-site", "same-origin")
+                .header("sec-fetch-mode", "cors")
+                .header("sec-fetch-dest", "empty")
+                .header("referer", "https://auth.meta.com/")
+                .header("accept-language", "en-US,en;q=0.9")
+                .header("priority", "u=1, i")
                 .build()
 
             client.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
-                val cookies = response.headers("Set-Cookie").joinToString("; ") { it.split(";")[0] }
+                val parsed = parseMetaResponse(body)
+                val (success, reason) = classifyCreateResponse(response.code, parsed, body)
 
-                // Parse uid and tokens
-                val uidMatch = Pattern.compile("\"uid\":\\s*\"?(\\d+)\"?").matcher(body)
-                val uid = if (uidMatch.find()) uidMatch.group(1) else ""
-
-                val fbDtsgMatch = Pattern.compile("\\[\"DTSGInitialData\",\\[\\],\\{\"token\":\"([^\"]+)\"\\}").matcher(body)
-                val fbDtsg = if (fbDtsgMatch.find()) fbDtsgMatch.group(1) else ""
-
-                val lsdMatch = Pattern.compile("\\[\"LSD\",\\[\\],\\{\"token\":\"([^\"]+)\"\\}").matcher(body)
-                val lsd = if (lsdMatch.find()) lsdMatch.group(1) else "AdRLdRXnKs4_RAGnmEr-k2XaQu0"
-
-                if (uid.isNotBlank()) {
-                    MetaCreateResult(
-                        success = true,
-                        uid = uid,
-                        cookie = cookies,
-                        confirmLink = "https://auth.meta.com/confirm_email/?email=$email",
-                        actorId = uid,
-                        fbDtsg = fbDtsg,
-                        lsd = lsd
-                    )
-                } else {
-                    MetaCreateResult(success = false, message = "Could not obtain UID from Meta response")
+                val fullCookies = mutableMapOf(
+                    "datr" to generateRandomToken(24),
+                    "ps_l" to "1",
+                    "ps_n" to "1",
+                    "locale" to "en_GB"
+                )
+                for (cookie in response.headers("Set-Cookie")) {
+                    val pair = cookie.split(";")[0].split("=")
+                    if (pair.size >= 2) {
+                        fullCookies[pair[0].trim()] = pair[1].trim()
+                    }
                 }
+                val cookieStr = fullCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
+
+                var extractedUid = ""
+                if (parsed != null && parsed.optJSONObject("payload") != null) {
+                    extractedUid = parsed.getJSONObject("payload").optString("uid", "")
+                } else if (success && reason.all { it.isDigit() }) {
+                    extractedUid = reason
+                }
+
+                if (!success || extractedUid.isBlank()) {
+                    return@withContext MetaCreateResult(success = false, message = reason)
+                }
+
+                val confirmLink = "https://auth.meta.com/register/confirm/?redirect_uri=https%3A%2F%2Fauth.meta.com%2Foidc%2F%3Fapp_id%3D1522763855472543&waterfall_id=$savedWf&csi=$savedCsi&event_flow=login_manual"
+
+                val checkRequest = Request.Builder()
+                    .url(confirmLink)
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; itel S665L Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.87 Mobile Safari/537.36")
+                    .header("Accept-Encoding", "gzip, deflate")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("sec-ch-ua-platform", "\"Android\"")
+                    .header("sec-ch-ua", "\"Chromium\";v=\"152\", \"Not?A_Brand\";v=\"24\", \"Android WebView\";v=\"152\"")
+                    .header("x-fb-friendly-name", "FRLConfirmEmailMutation")
+                    .header("sec-ch-ua-mobile", "?1")
+                    .header("x-asbd-id", "359341")
+                    .header("origin", "https://auth.meta.com")
+                    .header("x-requested-with", "mark.via.gp")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("sec-fetch-mode", "cors")
+                    .header("sec-fetch-dest", "empty")
+                    .header("accept-language", "en-US,en;q=0.9")
+                    .header("priority", "u=1, i")
+                    .header("Cookie", cookieStr)
+                    .header("referer", confirmLink)
+                    .build()
+
+                var liveDtsg = ""
+                var liveLsd = ""
+                var pageUid = ""
+
+                try {
+                    client.newCall(checkRequest).execute().use { confResp ->
+                        val confText = confResp.body?.string().orEmpty()
+                        val extracted = extractTokensAndUid(confText)
+                        liveDtsg = extracted.first
+                        liveLsd = extracted.second
+                        pageUid = extracted.third
+                    }
+                } catch (e: Exception) {
+                    // Ignore transient errors
+                }
+
+                val finalUid = extractedUid.ifEmpty { pageUid }
+
+                MetaCreateResult(
+                    success = true,
+                    email = email,
+                    uid = finalUid,
+                    cookie = cookieStr,
+                    csi = savedCsi,
+                    waterfallId = savedWf,
+                    confirmLink = confirmLink,
+                    actorId = finalUid,
+                    fbDtsg = liveDtsg,
+                    lsd = liveLsd
+                )
             }
         } catch (e: Exception) {
             MetaCreateResult(success = false, message = e.localizedMessage ?: "Unknown error")
         }
     }
 
-    private suspend fun confirmMetaOtp(session: UserSession, otp: String): MetaConfirmResult = withContext(Dispatchers.IO) {
+    private suspend fun confirmMetaOtp(session: UserSession, otpCode: String): MetaConfirmResult = withContext(Dispatchers.IO) {
         try {
+            val actorId = session.uid
+            val cookie = session.cookie
+            val savedCsi = session.csi.ifEmpty { "Scd0BS3l-yOix38o6lNKa_kT" }
+            val savedWf = session.waterfallId.ifEmpty { "701777af-c668-4a8d-976a-0c0f619d807a" }
+            val fbDtsg = session.fbDtsg.ifEmpty { "NAfw3-iVgzAwb3wze6-QRU-d6X36d-knUVwny-8I9gCaoBHl9mph0_A:16:1789089771" }
+            val lsd = session.lsd.ifEmpty { "mVvZ2A2krrrCYh31NtUS0j" }
+            val jazoest = calculateJazoest(fbDtsg)
+
+            val randomHex = (1..16).map { "0123456789abcdef".random() }.joinToString("")
+            val qplJoinId = "f$randomHex"
+
             val vPayload = JSONObject().apply {
                 put("input", JSONObject().apply {
-                    put("client_mutation_id", (1..9).map { ('a'..'z').random() }.joinToString(""))
-                    put("actor_id", session.actorId.ifEmpty { session.uid })
-                    put("contact_point", session.email)
-                    put("contact_point_type", "EMAIL_ADDRESS")
-                    put("confirmation_code", otp)
+                    put("confirmation_code", JSONObject().put("sensitive_string_value", otpCode))
+                    put("confirmation_code_type", "OTP_CODE")
+                    put("event_flow", "login_manual")
+                    put("rl_client_session_id", savedCsi)
+                    put("waterfall_id", savedWf)
+                    put("source_app_id", "1522763855472543")
+                    put("qpl_join_id", qplJoinId)
+                    put("actor_id", actorId)
+                    put("client_mutation_id", "1")
                 })
             }
 
             val formBuilder = FormBody.Builder()
-                .add("av", session.actorId.ifEmpty { session.uid })
-                .add("__user", session.actorId.ifEmpty { session.uid })
+                .add("av", actorId)
+                .add("__user", "0")
                 .add("__a", "1")
-                .add("__req", "2")
+                .add("__req", "g")
                 .add("__hs", "20707.HYP:frl_comet_auth_pkg.2.1...0")
                 .add("dpr", "2")
                 .add("__ccg", "MODERATE")
                 .add("__rev", "1047236770")
-                .add("fb_dtsg", session.fbDtsg)
-                .add("jazoest", "22293")
-                .add("lsd", session.lsd)
+                .add("fb_dtsg", fbDtsg)
+                .add("jazoest", jazoest)
+                .add("lsd", lsd)
                 .add("variables", vPayload.toString())
                 .add("doc_id", "9851798224911796")
 
             val reqBuilder = Request.Builder()
                 .url(TARGET_CONFIRM_URL)
                 .post(formBuilder.build())
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36")
-                .header("Origin", "https://auth.meta.com")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 12; itel S665L Build/SP1A.210812.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.87 Mobile Safari/537.36")
+                .header("Accept-Encoding", "gzip, deflate")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("sec-ch-ua-platform", "\"Android\"")
+                .header("sec-ch-ua", "\"Chromium\";v=\"152\", \"Not?A_Brand\";v=\"24\", \"Android WebView\";v=\"152\"")
                 .header("x-fb-friendly-name", "FRLConfirmEmailMutation")
-
-            if (session.cookie.isNotBlank()) {
-                reqBuilder.header("Cookie", session.cookie)
-            }
+                .header("sec-ch-ua-mobile", "?1")
+                .header("x-asbd-id", "359341")
+                .header("origin", "https://auth.meta.com")
+                .header("x-requested-with", "mark.via.gp")
+                .header("sec-fetch-site", "same-origin")
+                .header("sec-fetch-mode", "cors")
+                .header("sec-fetch-dest", "empty")
+                .header("accept-language", "en-US,en;q=0.9")
+                .header("priority", "u=1, i")
+                .header("Cookie", cookie)
+                .header("x-fb-lsd", lsd)
+                .header("referer", session.confirmLink.ifEmpty { "https://auth.meta.com/register/confirm/" })
 
             client.newCall(reqBuilder.build()).execute().use { response ->
                 val body = response.body?.string().orEmpty()
-                val isConfirmed = body.contains("\"isConfirmed\":true") || body.contains("true")
-                val accMatch = Pattern.compile("\"accountId\":\"(\\d+)\"").matcher(body)
-                val accountId = if (accMatch.find()) accMatch.group(1) else session.uid
+                val parsed = parseMetaResponse(body)
+                val confirmInfo = parsed?.optJSONObject("data")?.optJSONObject("confirm_email")
+                val isConfirmed = confirmInfo?.optBoolean("isConfirmed", false) ?: (body.contains("\"isConfirmed\":true") || body.contains("true"))
+                val accountId = confirmInfo?.optString("accountId", actorId) ?: actorId
 
                 MetaConfirmResult(
                     confirmed = isConfirmed,
-                    uid = accountId
+                    uid = if (accountId.isNotBlank()) accountId else actorId
                 )
             }
         } catch (e: Exception) {
