@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Bot Host",
+  "description": "টেলিগ্রাম বট হোস্ট ও রানার অ্যাপ - সহজ বট পরিচালনা ও মেসেজ রেসপন্স সিস্টেম।",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
